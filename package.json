@@ -1,0 +1,33 @@
+{
+  "name": "pi-cache-warmer",
+  "version": "0.1.0",
+  "description": "Keeps the Anthropic/Claude prompt cache warm across idle periods in the pi coding agent. Anthropic's default prompt-cache TTL is 5 minutes: if no request reads a cached prefix within that window it expires. This extension replays the last real provider request with max_tokens=1 shortly before the TTL would lapse, reading (and thus refreshing) the same cached prefix without spending a full turn.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "anthropic",
+    "claude",
+    "prompt-cache",
+    "cache-warming"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.73.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.73.1",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}
