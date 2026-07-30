@@ -164,6 +164,7 @@ export function createWarmer(deps: WarmerDeps): Warmer {
 				signal: timeout.signal,
 			});
 			state.warmCount += 1;
+			deps.notify(`warmed (count ${state.warmCount})`, "info");
 		} finally {
 			timeout.dispose();
 		}

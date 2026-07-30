@@ -163,6 +163,22 @@ describe("createWarmer — fireNow (AC1, AC2, AC4)", () => {
 		assert.strictEqual(warmer.warmCount, 1);
 	});
 
+	it("AC1: calls deps.notify exactly once with level 'info' and the running warm count on success", async () => {
+		const notifications: { message: string; level: string }[] = [];
+		const deps = createFakeDeps({
+			notify: (message, level) => notifications.push({ message, level }),
+		});
+		const warmer = createWarmer(deps);
+		warmer.capture(samplePayload(), anthropicModel());
+
+		await warmer.fireNow();
+
+		assert.strictEqual(notifications.length, 1);
+		assert.strictEqual(notifications[0]!.level, "info");
+		assert.ok(notifications[0]!.message.includes("warmed (count 1)"));
+		assert.strictEqual(warmer.warmCount, 1);
+	});
+
 	it("AC4: resolves auth via the injected resolveAuth and sends it as x-api-key when no authorization header is present", async () => {
 		const deps = createFakeDeps({
 			resolveAuth: async (model) => {
