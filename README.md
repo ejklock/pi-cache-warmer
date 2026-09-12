@@ -1,7 +1,8 @@
 # pi-cache-warmer
 
-A [pi](https://github.com/mariozechner/pi) extension that keeps the Anthropic/Claude
-**prompt cache** warm across idle periods in a session.
+A [pi](https://github.com/mariozechner/pi) extension that keeps a provider's
+**prompt cache** warm across idle periods in a session. It supports the
+Anthropic Messages API and the OpenAI Chat Completions and Responses APIs.
 
 ## Install
 
@@ -15,32 +16,36 @@ To disable it at any time without uninstalling, set `PI_CACHE_WARMER_DISABLED=1`
 
 ---
 
-## The problem: a 5-minute cache TTL
+## The problem: a ~5-minute cache TTL
 
-Anthropic's prompt caching stores a cached prefix (system prompt, tools, long
-context) and reuses it on subsequent requests to skip re-processing those
-tokens — but only if a request reads that cached prefix **within 5 minutes**
-of the last read. If a session sits idle for longer than that (thinking,
-waiting on the user, a long-running background task), the cache expires and
-the next real request pays full price to rebuild it.
+Anthropic and OpenAI both cache a request's prefix (system prompt, tools,
+long context) and reuse it on subsequent requests to skip re-processing those
+tokens — but only if a request reads that cached prefix within roughly 5 to
+10 minutes of the last read. If a session sits idle for longer than that
+(thinking, waiting on the user, a long-running background task), the cache
+expires and the next real request pays full price to rebuild it.
 
 ## The mechanism: replay, don't rebuild
 
 `pi-cache-warmer` captures the exact JSON body of the last real provider
 request pi sent (via the `before_provider_request` extension event — the
-request already carries the right `cache_control` breakpoints). When the
-agent goes idle, the extension arms a timer. If nothing else happens before
-the timer fires, it **replays that exact captured payload** against the
-Anthropic Messages API, overriding only:
+request already carries the right cache markers, such as `cache_control` or
+`prompt_cache_key`). When the agent goes idle, the extension arms a timer. If
+nothing else happens before the timer fires, it **replays that exact
+captured payload** against the same API the model uses, overriding only:
 
-- `max_tokens` → `1` (the smallest possible response)
+- the output-token cap (`max_tokens`, `max_completion_tokens`, or
+  `max_output_tokens`, depending on the API) → `1`, or a small reasoning
+  floor when the captured payload signals a reasoning request (the smallest
+  cap a reasoning-capable model accepts)
 - `stream` → `false` (no need for a streaming connection)
-- `tool_choice` is dropped (irrelevant for a 1-token reply)
+- `tool_choice` is dropped (irrelevant for a minimal reply)
+- for the Responses API, `store` → `false`
 
-Everything else — `system`, `messages`, `tools`, and their `cache_control`
+Everything else — `system`/`input`, `messages`, `tools`, and their cache
 markers — is sent byte-for-byte identical to the original request. Reading
-that cached prefix resets its 5-minute TTL, at effectively the cost of a
-single output token plus a cheap cache-read.
+that cached prefix resets its TTL, at effectively the cost of a small
+output-token reply plus a cheap cache-read.
 
 The extension **never rebuilds** a request from pi's internal `Context`
 representation; v1 only replays what was already sent on the wire. It also
@@ -49,10 +54,15 @@ never mutates the real request: `before_provider_request` handlers return
 
 ## Scope
 
-Only models with `api === "anthropic-messages"` are warmed. Every other
-provider (OpenAI, Google, etc.) is a no-op. They do not schedule a warm or show
-warmer status. Those APIs have different (or no) prompt-caching semantics that
-this extension does not attempt to model.
+Three provider dialects are warmed, selected by the captured model's `api`:
+
+- `anthropic-messages` — POSTs to `{baseUrl}/v1/messages`.
+- `openai-completions` — POSTs to `{baseUrl}/chat/completions`.
+- `openai-responses` — POSTs to `{baseUrl}/responses`.
+
+Every other `api` (Google's `google-generative-ai`, etc.) is a no-op. They do
+not schedule a warm or show warmer status. Those APIs have different (or no)
+prompt-caching semantics that this extension does not attempt to model.
 
 ## Scheduling
 
@@ -68,8 +78,9 @@ this extension does not attempt to model.
 - Only one warm request is ever in flight at a time.
 - After a successful or failed warm attempt, the timer re-arms automatically
   while the session remains idle.
-- For eligible Anthropic targets only, pi TUI and RPC UI modes show the
-  persistent `pi-cache-warmer` footer status. It shows `next warm scheduled`,
+- For eligible targets only (one of the three supported dialects), pi TUI
+  and RPC UI modes show the persistent `pi-cache-warmer` footer status. It
+  shows `next warm scheduled`,
   then `warming cache` during an attempt. After success, it shows
   `warmed (count N); next warm scheduled`, where `N` is the successful warm
   count for the current session.
@@ -119,7 +130,8 @@ next time the user actually sends a message.
 
 - It does not support Anthropic's 1-hour cache TTL beta — v1 targets the
   default 5-minute TTL only.
-- It does not warm any non-Anthropic provider.
+- It does not warm Google Gemini's `CachedContent` API — deferred.
+- It does not warm any api outside the three supported dialects.
 - It does not reconstruct or validate the payload against pi's `Context`
   model; it is a verbatim replay of the last request pi actually sent.
 

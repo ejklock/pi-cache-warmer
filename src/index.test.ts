@@ -2,9 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 import piCacheWarmer, {
-	buildWarmBody,
-	anthropicEndpoint,
-	isAnthropicModel,
+	getDialect,
+	isWarmableModel,
 	isDisabled,
 	resolveIntervalMs,
 	createWarmer,
@@ -58,8 +57,16 @@ function anthropicModel(baseUrl = "https://api.anthropic.com") {
 	return { api: "anthropic-messages", baseUrl } as unknown as Parameters<WarmerDeps["resolveAuth"]>[0];
 }
 
-function openAiModel() {
-	return { api: "openai-completions", baseUrl: "https://api.openai.com" } as unknown as Parameters<
+function openAiModel(baseUrl = "https://api.openai.com/v1") {
+	return { api: "openai-completions", baseUrl } as unknown as Parameters<WarmerDeps["resolveAuth"]>[0];
+}
+
+function openAiResponsesModel(baseUrl = "https://api.openai.com/v1") {
+	return { api: "openai-responses", baseUrl } as unknown as Parameters<WarmerDeps["resolveAuth"]>[0];
+}
+
+function geminiModel() {
+	return { api: "google-generative-ai", baseUrl: "https://generativelanguage.googleapis.com" } as unknown as Parameters<
 		WarmerDeps["resolveAuth"]
 	>[0];
 }
@@ -103,30 +110,48 @@ describe("resolveIntervalMs (AC3)", () => {
 	});
 });
 
-describe("isDisabled / isAnthropicModel / anthropicEndpoint", () => {
+describe("isDisabled / isWarmableModel / getDialect", () => {
 	it("isDisabled is true only for the exact string '1'", () => {
 		assert.strictEqual(isDisabled({ PI_CACHE_WARMER_DISABLED: "1" }), true);
 		assert.strictEqual(isDisabled({ PI_CACHE_WARMER_DISABLED: "true" }), false);
 		assert.strictEqual(isDisabled({}), false);
 	});
 
-	it("isAnthropicModel matches only api === 'anthropic-messages'", () => {
-		assert.strictEqual(isAnthropicModel(anthropicModel()), true);
-		assert.strictEqual(isAnthropicModel(openAiModel()), false);
-		assert.strictEqual(isAnthropicModel(undefined), false);
+	it("isWarmableModel matches the anthropic-messages and openai dialects", () => {
+		assert.strictEqual(isWarmableModel(anthropicModel()), true);
+		assert.strictEqual(isWarmableModel(openAiModel()), true);
+		assert.strictEqual(isWarmableModel(openAiResponsesModel()), true);
+		assert.strictEqual(isWarmableModel(undefined), false);
 	});
 
-	it("anthropicEndpoint appends /v1/messages and strips a trailing slash", () => {
-		assert.strictEqual(anthropicEndpoint(anthropicModel()), "https://api.anthropic.com/v1/messages");
-		const trailing = { baseUrl: "https://api.anthropic.com/" } as unknown as Parameters<typeof anthropicEndpoint>[0];
-		assert.strictEqual(anthropicEndpoint(trailing), "https://api.anthropic.com/v1/messages");
+	it("AC5: isWarmableModel rejects an unsupported api such as google-generative-ai", () => {
+		assert.strictEqual(isWarmableModel(geminiModel()), false);
+		assert.strictEqual(getDialect(geminiModel()), undefined);
+	});
+
+	it("anthropic-messages dialect endpoint appends /v1/messages and strips a trailing slash", () => {
+		const dialect = getDialect(anthropicModel())!;
+		assert.strictEqual(dialect.endpoint(anthropicModel()), "https://api.anthropic.com/v1/messages");
+		const trailing = anthropicModel("https://api.anthropic.com/");
+		assert.strictEqual(dialect.endpoint(trailing), "https://api.anthropic.com/v1/messages");
+	});
+
+	it("AC2: openai-completions dialect endpoint appends /chat/completions to a baseUrl that already includes /v1", () => {
+		const dialect = getDialect(openAiModel())!;
+		assert.strictEqual(dialect.endpoint(openAiModel()), "https://api.openai.com/v1/chat/completions");
+	});
+
+	it("AC3: openai-responses dialect endpoint appends /responses to a baseUrl that already includes /v1", () => {
+		const dialect = getDialect(openAiResponsesModel())!;
+		assert.strictEqual(dialect.endpoint(openAiResponsesModel()), "https://api.openai.com/v1/responses");
 	});
 });
 
-describe("buildWarmBody", () => {
-	it("overrides max_tokens and stream without mutating the captured payload", () => {
+describe("minimizeBody per dialect (AC1, AC2, AC3, AC4, AC7)", () => {
+	it("AC1/AC7: anthropic dialect overrides max_tokens and stream without mutating the captured payload", () => {
 		const payload = samplePayload();
-		const body = buildWarmBody(payload) as ReturnType<typeof samplePayload>;
+		const dialect = getDialect(anthropicModel())!;
+		const body = dialect.minimizeBody(payload) as ReturnType<typeof samplePayload>;
 
 		assert.strictEqual(body.max_tokens, 1);
 		assert.strictEqual(body.stream, false);
@@ -137,14 +162,72 @@ describe("buildWarmBody", () => {
 		assert.strictEqual(body.tools, payload.tools);
 	});
 
-	it("excludes tool_choice from the serialized warm body", () => {
-		const body = buildWarmBody(samplePayload());
+	it("AC1: excludes tool_choice from the serialized anthropic warm body", () => {
+		const dialect = getDialect(anthropicModel())!;
+		const body = dialect.minimizeBody(samplePayload());
 		assert.strictEqual(JSON.stringify(body).includes("tool_choice"), false);
 	});
 
-	it("passes through non-object payloads unchanged", () => {
-		assert.strictEqual(buildWarmBody(null), null);
-		assert.strictEqual(buildWarmBody("raw"), "raw");
+	it("passes through non-object payloads unchanged for every dialect", () => {
+		for (const model of [anthropicModel(), openAiModel(), openAiResponsesModel()]) {
+			const dialect = getDialect(model)!;
+			assert.strictEqual(dialect.minimizeBody(null), null);
+			assert.strictEqual(dialect.minimizeBody("raw"), "raw");
+		}
+	});
+
+	it("AC2: openai-completions dialect minimizes max_tokens to 1 without a reasoning signal", () => {
+		const payload = { model: "gpt-4o", max_tokens: 4096, stream: true, messages: [{ role: "user", content: "hi" }] };
+		const dialect = getDialect(openAiModel())!;
+		const body = dialect.minimizeBody(payload) as typeof payload;
+
+		assert.strictEqual(body.max_tokens, 1);
+		assert.strictEqual(body.stream, false);
+		assert.strictEqual(payload.max_tokens, 4096);
+	});
+
+	it("AC2: openai-completions dialect minimizes whichever of max_tokens/max_completion_tokens is present", () => {
+		const payload = { model: "gpt-4o", max_completion_tokens: 4096, stream: true, messages: [] };
+		const dialect = getDialect(openAiModel())!;
+		const body = dialect.minimizeBody(payload) as Record<string, unknown>;
+
+		assert.strictEqual(body.max_completion_tokens, 1);
+		assert.strictEqual("max_tokens" in body, false);
+	});
+
+	it("AC4: openai-completions dialect raises the cap to the reasoning floor when reasoning_effort is present", () => {
+		const payload = { model: "o1", max_completion_tokens: 4096, reasoning_effort: "medium", stream: true, messages: [] };
+		const dialect = getDialect(openAiModel())!;
+		const body = dialect.minimizeBody(payload) as Record<string, unknown>;
+
+		assert.strictEqual(body.max_completion_tokens, 16);
+		assert.ok((body.max_completion_tokens as number) > 1);
+	});
+
+	it("AC3: openai-responses dialect minimizes max_output_tokens to 1 and keeps store false without a reasoning signal", () => {
+		const payload = { model: "gpt-4o", max_output_tokens: 4096, stream: true, input: [{ role: "user", content: "hi" }] };
+		const dialect = getDialect(openAiResponsesModel())!;
+		const body = dialect.minimizeBody(payload) as Record<string, unknown>;
+
+		assert.strictEqual(body.max_output_tokens, 1);
+		assert.strictEqual(body.store, false);
+		assert.strictEqual(body.stream, false);
+		assert.strictEqual(body.input, payload.input);
+	});
+
+	it("AC4: openai-responses dialect raises the cap to the reasoning floor when a reasoning object is present", () => {
+		const payload = {
+			model: "o1",
+			max_output_tokens: 4096,
+			reasoning: { effort: "medium" },
+			stream: true,
+			input: [],
+		};
+		const dialect = getDialect(openAiResponsesModel())!;
+		const body = dialect.minimizeBody(payload) as Record<string, unknown>;
+
+		assert.strictEqual(body.max_output_tokens, 16);
+		assert.ok((body.max_output_tokens as number) > 1);
 	});
 });
 
@@ -261,14 +344,115 @@ describe("createWarmer — fireNow (AC1, AC2, AC4)", () => {
 		assert.strictEqual(deps.fetchCalls.length, 0);
 	});
 
-	it("AC2: issues no request for a non-Anthropic model", async () => {
+	it("AC5: issues no request for an unsupported api such as google-generative-ai", async () => {
 		const deps = createFakeDeps();
 		const warmer = createWarmer(deps);
-		warmer.capture(samplePayload(), openAiModel());
+		warmer.capture(samplePayload(), geminiModel());
 
 		await warmer.fireNow();
 
 		assert.strictEqual(deps.fetchCalls.length, 0);
+	});
+
+	it("AC2: warms an openai-completions model by POSTing to /chat/completions with no anthropic-version header", async () => {
+		const deps = createFakeDeps();
+		const warmer = createWarmer(deps);
+		const payload = {
+			model: "gpt-4o",
+			max_tokens: 4096,
+			stream: true,
+			system: "system prompt",
+			messages: [{ role: "user", content: "hello" }],
+			tools: [{ name: "bash" }],
+			tool_choice: "auto",
+			prompt_cache_key: "session-1",
+		};
+
+		warmer.capture(payload, openAiModel());
+		await warmer.fireNow();
+
+		assert.strictEqual(deps.fetchCalls.length, 1);
+		const [call] = deps.fetchCalls;
+		assert.strictEqual(call!.url, "https://api.openai.com/v1/chat/completions");
+		assert.strictEqual("anthropic-version" in call!.init.headers, false);
+		assert.strictEqual(call!.init.headers.authorization, "Bearer test-api-key");
+
+		const body = JSON.parse(call!.init.body) as typeof payload;
+		assert.strictEqual(body.max_tokens, 1);
+		assert.strictEqual(body.stream, false);
+		assert.deepStrictEqual(body.messages, payload.messages);
+		assert.deepStrictEqual(body.tools, payload.tools);
+		assert.strictEqual(body.system, payload.system);
+		assert.strictEqual(body.prompt_cache_key, payload.prompt_cache_key);
+		assert.strictEqual(JSON.stringify(body).includes("tool_choice"), false);
+		assert.strictEqual(warmer.warmCount, 1);
+	});
+
+	it("AC4: warms an openai-completions reasoning model at the reasoning floor instead of 1", async () => {
+		const deps = createFakeDeps();
+		const warmer = createWarmer(deps);
+		const payload = {
+			model: "o1",
+			max_completion_tokens: 4096,
+			reasoning_effort: "medium",
+			stream: true,
+			messages: [{ role: "user", content: "hello" }],
+		};
+
+		warmer.capture(payload, openAiModel());
+		await warmer.fireNow();
+
+		const [call] = deps.fetchCalls;
+		const body = JSON.parse(call!.init.body) as Record<string, unknown>;
+		assert.strictEqual(body.max_completion_tokens, 16);
+	});
+
+	it("AC3: warms an openai-responses model by POSTing to /responses with store:false and no anthropic-version header", async () => {
+		const deps = createFakeDeps();
+		const warmer = createWarmer(deps);
+		const payload = {
+			model: "gpt-4o",
+			max_output_tokens: 4096,
+			stream: true,
+			input: [{ role: "user", content: "hello" }],
+			tools: [{ name: "bash" }],
+		};
+
+		warmer.capture(payload, openAiResponsesModel());
+		await warmer.fireNow();
+
+		assert.strictEqual(deps.fetchCalls.length, 1);
+		const [call] = deps.fetchCalls;
+		assert.strictEqual(call!.url, "https://api.openai.com/v1/responses");
+		assert.strictEqual("anthropic-version" in call!.init.headers, false);
+		assert.strictEqual(call!.init.headers.authorization, "Bearer test-api-key");
+
+		const body = JSON.parse(call!.init.body) as typeof payload & { store: boolean };
+		assert.strictEqual(body.max_output_tokens, 1);
+		assert.strictEqual(body.store, false);
+		assert.strictEqual(body.stream, false);
+		assert.deepStrictEqual(body.input, payload.input);
+		assert.deepStrictEqual(body.tools, payload.tools);
+		assert.strictEqual(warmer.warmCount, 1);
+	});
+
+	it("AC4: warms an openai-responses reasoning model at the reasoning floor instead of 1", async () => {
+		const deps = createFakeDeps();
+		const warmer = createWarmer(deps);
+		const payload = {
+			model: "o1",
+			max_output_tokens: 4096,
+			reasoning: { effort: "medium" },
+			stream: true,
+			input: [{ role: "user", content: "hello" }],
+		};
+
+		warmer.capture(payload, openAiResponsesModel());
+		await warmer.fireNow();
+
+		const [call] = deps.fetchCalls;
+		const body = JSON.parse(call!.init.body) as Record<string, unknown>;
+		assert.strictEqual(body.max_output_tokens, 16);
 	});
 
 	it("AC2: issues no request when the session is not idle", async () => {
@@ -349,11 +533,11 @@ describe("createWarmer — scheduler (AC5)", () => {
 		assert.strictEqual(statuses.at(-1), undefined);
 	});
 
-	it("does not schedule or advertise a warm for an unsupported model", () => {
+	it("AC5: does not schedule or advertise a warm for an unsupported api such as google-generative-ai", () => {
 		const statuses: (string | undefined)[] = [];
 		const deps = createFakeDeps({ setStatus: (message) => statuses.push(message) });
 		const warmer = createWarmer(deps);
-		warmer.capture(samplePayload(), openAiModel());
+		warmer.capture(samplePayload(), geminiModel());
 
 		warmer.arm();
 

@@ -3,7 +3,12 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 const INSTALL_SYMBOL = Symbol.for("klock.pi-cache-warmer.installed");
 
 const ANTHROPIC_API = "anthropic-messages";
+const OPENAI_COMPLETIONS_API = "openai-completions";
+const OPENAI_RESPONSES_API = "openai-responses";
 const ANTHROPIC_VERSION = "2023-06-01";
+// A minimized reasoning request still needs enough output tokens to emit at least
+// one reasoning-then-answer step; 1 token is rejected by reasoning-capable models.
+const REASONING_OUTPUT_FLOOR = 16;
 const DISABLE_ENV_VAR = "PI_CACHE_WARMER_DISABLED";
 const INTERVAL_ENV_VAR = "PI_CACHE_WARMER_INTERVAL_MS";
 const DEFAULT_INTERVAL_MS = 240000;
@@ -89,35 +94,110 @@ export function resolveIntervalMs(env: EnvRecord): number {
 	return Math.min(Math.max(candidate, MIN_INTERVAL_MS), MAX_INTERVAL_MS);
 }
 
-export function isAnthropicModel(model: AnyModel | undefined): model is AnyModel {
-	return model?.api === ANTHROPIC_API;
+interface ProviderDialect {
+	endpoint(model: AnyModel): string;
+	minimizeBody(payload: unknown): unknown;
+	versionHeaders(): Record<string, string>;
+	applyBareKey(headers: Record<string, string>, apiKey: string): void;
 }
 
-export function anthropicEndpoint(model: AnyModel): string {
-	return `${String(model.baseUrl).replace(/\/+$/, "")}/v1/messages`;
+function stripTrailingSlash(baseUrl: unknown): string {
+	return String(baseUrl).replace(/\/+$/, "");
 }
 
-export function buildWarmBody(payload: unknown): unknown {
-	if (!payload || typeof payload !== "object") return payload;
+function cloneMinimalBody(payload: unknown): Record<string, unknown> | undefined {
+	if (!payload || typeof payload !== "object") return undefined;
 	const clone: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
-	clone.max_tokens = 1;
 	clone.stream = false;
 	// JSON.stringify drops undefined-valued keys, so this excludes tool_choice from the wire payload.
 	clone.tool_choice = undefined;
 	return clone;
 }
 
+function minimizeAnthropicBody(payload: unknown): unknown {
+	const clone = cloneMinimalBody(payload);
+	if (!clone) return payload;
+	clone.max_tokens = 1;
+	// A minimized thinking block would reject max_tokens=1, so drop it entirely.
+	clone.thinking = undefined;
+	return clone;
+}
+
+function minimizeOpenAiCompletionsBody(payload: unknown): unknown {
+	const clone = cloneMinimalBody(payload);
+	if (!clone) return payload;
+	const cap = "reasoning_effort" in clone ? REASONING_OUTPUT_FLOOR : 1;
+	const outputTokenField = "max_completion_tokens" in clone ? "max_completion_tokens" : "max_tokens";
+	clone[outputTokenField] = cap;
+	return clone;
+}
+
+function minimizeOpenAiResponsesBody(payload: unknown): unknown {
+	const clone = cloneMinimalBody(payload);
+	if (!clone) return payload;
+	const hasReasoning = typeof clone.reasoning === "object" && clone.reasoning !== null;
+	clone.max_output_tokens = hasReasoning ? REASONING_OUTPUT_FLOOR : 1;
+	clone.store = false;
+	return clone;
+}
+
+function anthropicVersionHeaders(): Record<string, string> {
+	return { "anthropic-version": ANTHROPIC_VERSION };
+}
+
+function noVersionHeaders(): Record<string, string> {
+	return {};
+}
+
+function applyAnthropicBareKey(headers: Record<string, string>, apiKey: string): void {
+	headers["x-api-key"] = apiKey;
+}
+
+function applyBearerBareKey(headers: Record<string, string>, apiKey: string): void {
+	headers.authorization = `Bearer ${apiKey}`;
+}
+
+const DIALECTS: Partial<Record<string, ProviderDialect>> = {
+	[ANTHROPIC_API]: {
+		endpoint: (model) => `${stripTrailingSlash(model.baseUrl)}/v1/messages`,
+		minimizeBody: minimizeAnthropicBody,
+		versionHeaders: anthropicVersionHeaders,
+		applyBareKey: applyAnthropicBareKey,
+	},
+	[OPENAI_COMPLETIONS_API]: {
+		endpoint: (model) => `${stripTrailingSlash(model.baseUrl)}/chat/completions`,
+		minimizeBody: minimizeOpenAiCompletionsBody,
+		versionHeaders: noVersionHeaders,
+		applyBareKey: applyBearerBareKey,
+	},
+	[OPENAI_RESPONSES_API]: {
+		endpoint: (model) => `${stripTrailingSlash(model.baseUrl)}/responses`,
+		minimizeBody: minimizeOpenAiResponsesBody,
+		versionHeaders: noVersionHeaders,
+		applyBareKey: applyBearerBareKey,
+	},
+};
+
+export function getDialect(model: AnyModel | undefined): ProviderDialect | undefined {
+	if (!model) return undefined;
+	return DIALECTS[model.api];
+}
+
+export function isWarmableModel(model: AnyModel | undefined): model is AnyModel {
+	return getDialect(model) !== undefined;
+}
+
 function hasAuthorizationHeader(headers: Record<string, string>): boolean {
 	return Object.keys(headers).some((key) => key.toLowerCase() === "authorization");
 }
 
-function buildWarmHeaders(auth: AuthorizedAuth): Record<string, string> {
+function buildWarmHeaders(dialect: ProviderDialect, auth: AuthorizedAuth): Record<string, string> {
 	const headers: Record<string, string> = {
 		"content-type": "application/json",
-		"anthropic-version": ANTHROPIC_VERSION,
+		...dialect.versionHeaders(),
 		...(auth.headers ?? {}),
 	};
-	if (!hasAuthorizationHeader(headers) && auth.apiKey) headers["x-api-key"] = auth.apiKey;
+	if (!hasAuthorizationHeader(headers) && auth.apiKey) dialect.applyBareKey(headers, auth.apiKey);
 	return headers;
 }
 
@@ -142,7 +222,7 @@ function cancelWarm(deps: WarmerDeps, state: WarmerState): void {
 }
 
 function hasEligibleWarmTarget(deps: WarmerDeps, state: WarmerState): boolean {
-	return !state.disposed && state.lastPayload !== undefined && isAnthropicModel(state.lastModel) && !isDisabled(deps.env);
+	return !state.disposed && state.lastPayload !== undefined && isWarmableModel(state.lastModel) && !isDisabled(deps.env);
 }
 
 function canScheduleWarm(deps: WarmerDeps, state: WarmerState): boolean {
@@ -151,7 +231,7 @@ function canScheduleWarm(deps: WarmerDeps, state: WarmerState): boolean {
 
 function currentWarmTarget(deps: WarmerDeps, state: WarmerState): WarmTarget | undefined {
 	const model = state.lastModel;
-	if (!canScheduleWarm(deps, state) || !deps.isIdle() || !isAnthropicModel(model)) return undefined;
+	if (!canScheduleWarm(deps, state) || !deps.isIdle() || !isWarmableModel(model)) return undefined;
 	return { model, payload: state.lastPayload, version: state.targetVersion, activityGeneration: state.activityGeneration };
 }
 
@@ -220,14 +300,16 @@ async function sendWarmRequest(deps: WarmerDeps, state: WarmerState, target: War
 		notifyWarmStatus(deps, state, "warm request skipped", "warning");
 		return;
 	}
+	const dialect = getDialect(target.model);
+	if (!dialect) return;
 	const timeout = withTimeoutSignal(deps, WARM_REQUEST_TIMEOUT_MS);
 	state.activeRequest = timeout.controller;
 	try {
 		if (!hasCurrentWarmTarget(state, target)) return;
-		const response = await deps.fetchImpl(anthropicEndpoint(target.model), {
+		const response = await deps.fetchImpl(dialect.endpoint(target.model), {
 			method: "POST",
-			headers: buildWarmHeaders(auth),
-			body: JSON.stringify(buildWarmBody(target.payload)),
+			headers: buildWarmHeaders(dialect, auth),
+			body: JSON.stringify(dialect.minimizeBody(target.payload)),
 			signal: timeout.controller.signal,
 		});
 		if (!hasCurrentWarmTarget(state, target)) return;

@@ -1,7 +1,7 @@
 {
   "name": "pi-cache-warmer",
-  "version": "0.1.1",
-  "description": "Keeps the Anthropic/Claude prompt cache warm across idle periods in the pi coding agent. Anthropic's default prompt-cache TTL is 5 minutes: if no request reads a cached prefix within that window it expires. This extension replays the last real provider request with max_tokens=1 shortly before the TTL would lapse, reading (and thus refreshing) the same cached prefix without spending a full turn.",
+  "version": "0.2.0",
+  "description": "Keeps the Anthropic and OpenAI prompt cache warm across idle periods in the pi coding agent. These providers' prompt-cache TTLs are roughly 5-10 minutes: if no request reads a cached prefix within that window it expires. This extension replays the last real provider request with a minimized output-token cap shortly before the TTL would lapse, reading (and thus refreshing) the same cached prefix without spending a full turn.",
   "license": "MIT",
   "type": "module",
   "private": true,
@@ -10,6 +10,7 @@
     "pi-coding-agent",
     "anthropic",
     "claude",
+    "openai",
     "prompt-cache",
     "cache-warming"
   ],
