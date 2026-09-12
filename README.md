@@ -50,18 +50,33 @@ never mutates the real request: `before_provider_request` handlers return
 ## Scope
 
 Only models with `api === "anthropic-messages"` are warmed. Every other
-provider (OpenAI, Google, etc.) is a no-op — those APIs have different (or no)
-prompt-caching semantics that this extension does not attempt to model.
+provider (OpenAI, Google, etc.) is a no-op. They do not schedule a warm or show
+warmer status. Those APIs have different (or no) prompt-caching semantics that
+this extension does not attempt to model.
 
 ## Scheduling
 
 - The warmer arms an idle timer on `agent_end` and cancels it as soon as new
-  activity starts (`agent_start`, `input`, or another real provider request).
+  activity starts (`agent_start` or `input`). Cancellation removes the pending
+  timer and its `next warm scheduled` footer text. An active warm reports its
+  final outcome but does not retry after pi becomes busy.
+- Another real provider request replaces the captured target. If it arrives
+  during a warm, the warmer clears the old active footer and ignores the stale
+  result. A normal later `agent_end` schedules the newly captured target.
 - The timer is a `setTimeout(...).unref()`, so it never keeps the pi process
   alive on its own.
 - Only one warm request is ever in flight at a time.
-- After a successful (or failed) warm attempt, the timer re-arms automatically
-  as long as the session is still idle.
+- After a successful or failed warm attempt, the timer re-arms automatically
+  while the session remains idle.
+- For eligible Anthropic targets only, pi TUI and RPC UI modes show the
+  persistent `pi-cache-warmer` footer status. It shows `next warm scheduled`,
+  then `warming cache` during an attempt. After success, it shows
+  `warmed (count N); next warm scheduled`, where `N` is the successful warm
+  count for the current session.
+- While pi remains idle, a non-success HTTP response shows `warm request failed
+  (HTTP N); next warm scheduled`. Other request errors show `warm request
+  failed; next warm scheduled`. If pi becomes busy before completion, the
+  final outcome has no next-attempt suffix.
 - The timer is cleared for good on `session_shutdown`.
 - Installation is idempotent (guarded by a `Symbol.for` marker), so loading
   the extension twice in the same process is harmless.

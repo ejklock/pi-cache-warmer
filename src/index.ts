@@ -39,6 +39,11 @@ export interface WarmerDeps {
 	resolveAuth(model: AnyModel): Promise<ResolvedAuth>;
 	isIdle(): boolean;
 	notify(message: string, level: NotifyLevel): void;
+	/**
+	 * Updates or clears the persistent cache warmer status.
+	 * @param message - {string | undefined} The status message to show, or undefined to clear it.
+	 */
+	setStatus(message: string | undefined): void;
 	env: EnvRecord;
 }
 
@@ -59,11 +64,18 @@ interface WarmerState {
 	inFlight: boolean;
 	disposed: boolean;
 	warmCount: number;
+	lastWarmStatus: string;
+	activeRequest: AbortController | undefined;
+	targetVersion: number;
+	activityGeneration: number;
+	armRequested: boolean;
 }
 
 interface WarmTarget {
 	model: AnyModel;
 	payload: unknown;
+	version: number;
+	activityGeneration: number;
 }
 
 export function isDisabled(env: EnvRecord): boolean {
@@ -109,12 +121,161 @@ function buildWarmHeaders(auth: AuthorizedAuth): Record<string, string> {
 	return headers;
 }
 
-function withTimeoutSignal(deps: WarmerDeps, delayMs: number): { signal: AbortSignal; dispose: () => void } {
+function withTimeoutSignal(deps: WarmerDeps, delayMs: number): { controller: AbortController; dispose: () => void } {
 	const controller = new AbortController();
 	const handle = deps.setTimer(() => controller.abort(), delayMs);
-	return { signal: controller.signal, dispose: () => deps.clearTimer(handle) };
+	return { controller, dispose: () => deps.clearTimer(handle) };
 }
 
+function cancelTimer(deps: WarmerDeps, state: WarmerState): boolean {
+	if (state.timerHandle === undefined) return false;
+	deps.clearTimer(state.timerHandle);
+	state.timerHandle = undefined;
+	return true;
+}
+
+function cancelWarm(deps: WarmerDeps, state: WarmerState): void {
+	state.activityGeneration += 1;
+	state.armRequested = false;
+	const cancelled = cancelTimer(deps, state);
+	if (cancelled && !state.inFlight) deps.setStatus(state.lastWarmStatus || undefined);
+}
+
+function hasEligibleWarmTarget(deps: WarmerDeps, state: WarmerState): boolean {
+	return !state.disposed && state.lastPayload !== undefined && isAnthropicModel(state.lastModel) && !isDisabled(deps.env);
+}
+
+function canScheduleWarm(deps: WarmerDeps, state: WarmerState): boolean {
+	return hasEligibleWarmTarget(deps, state) && !state.inFlight;
+}
+
+function currentWarmTarget(deps: WarmerDeps, state: WarmerState): WarmTarget | undefined {
+	const model = state.lastModel;
+	if (!canScheduleWarm(deps, state) || !deps.isIdle() || !isAnthropicModel(model)) return undefined;
+	return { model, payload: state.lastPayload, version: state.targetVersion, activityGeneration: state.activityGeneration };
+}
+
+function hasCurrentWarmTarget(state: WarmerState, target: WarmTarget): boolean {
+	return !state.disposed && state.targetVersion === target.version;
+}
+
+function clearWarmStatus(deps: WarmerDeps, state: WarmerState): void {
+	state.lastWarmStatus = "";
+	deps.setStatus(undefined);
+}
+
+function publishWarmStatus(deps: WarmerDeps, state: WarmerState, message: string): void {
+	if (state.disposed) return;
+	state.lastWarmStatus = message;
+	deps.setStatus(message);
+}
+
+function notifyWarmStatus(deps: WarmerDeps, state: WarmerState, message: string, level: NotifyLevel): void {
+	if (state.disposed) return;
+	state.lastWarmStatus = message;
+	deps.notify(message, level);
+}
+
+function scheduleStatus(state: WarmerState): string {
+	return state.lastWarmStatus ? `${state.lastWarmStatus}; next warm scheduled` : "next warm scheduled";
+}
+
+function armWarm(deps: WarmerDeps, state: WarmerState): void {
+	if (state.disposed) return;
+	cancelTimer(deps, state);
+	if (!hasEligibleWarmTarget(deps, state)) {
+		state.armRequested = false;
+		clearWarmStatus(deps, state);
+		return;
+	}
+	if (state.inFlight) {
+		state.armRequested = true;
+		return;
+	}
+	state.armRequested = false;
+	state.timerHandle = deps.setTimer(() => {
+		state.timerHandle = undefined;
+		void fireWarmRequest(deps, state);
+	}, resolveIntervalMs(deps.env));
+	deps.setStatus(scheduleStatus(state));
+}
+
+function rearmWhenPossible(deps: WarmerDeps, state: WarmerState): void {
+	armWarm(deps, state);
+}
+
+function publishSettledWarmStatus(deps: WarmerDeps, state: WarmerState): void {
+	if (state.disposed) return;
+	if (state.lastWarmStatus === "warming cache") {
+		clearWarmStatus(deps, state);
+		return;
+	}
+	deps.setStatus(state.lastWarmStatus || undefined);
+}
+
+async function sendWarmRequest(deps: WarmerDeps, state: WarmerState, target: WarmTarget): Promise<void> {
+	const auth = await deps.resolveAuth(target.model);
+	if (!hasCurrentWarmTarget(state, target)) return;
+	if (!auth.ok) {
+		notifyWarmStatus(deps, state, "warm request skipped", "warning");
+		return;
+	}
+	const timeout = withTimeoutSignal(deps, WARM_REQUEST_TIMEOUT_MS);
+	state.activeRequest = timeout.controller;
+	try {
+		if (!hasCurrentWarmTarget(state, target)) return;
+		const response = await deps.fetchImpl(anthropicEndpoint(target.model), {
+			method: "POST",
+			headers: buildWarmHeaders(auth),
+			body: JSON.stringify(buildWarmBody(target.payload)),
+			signal: timeout.controller.signal,
+		});
+		if (!hasCurrentWarmTarget(state, target)) return;
+		if (!response.ok) {
+			notifyWarmStatus(deps, state, `warm request failed (HTTP ${response.status})`, "warning");
+			return;
+		}
+		state.warmCount += 1;
+		notifyWarmStatus(deps, state, `warmed (count ${state.warmCount})`, "info");
+	} finally {
+		timeout.dispose();
+		if (state.activeRequest === timeout.controller) state.activeRequest = undefined;
+	}
+}
+
+async function fireWarmRequest(deps: WarmerDeps, state: WarmerState): Promise<void> {
+	const target = currentWarmTarget(deps, state);
+	if (!target) {
+		rearmWhenPossible(deps, state);
+		return;
+	}
+	state.inFlight = true;
+	publishWarmStatus(deps, state, "warming cache");
+	try {
+		await sendWarmRequest(deps, state, target);
+	} catch {
+		if (hasCurrentWarmTarget(state, target)) notifyWarmStatus(deps, state, "warm request failed", "warning");
+	} finally {
+		state.inFlight = false;
+	}
+	const deferredArmRequested = state.armRequested;
+	state.armRequested = false;
+	if (!hasCurrentWarmTarget(state, target)) {
+		if (deferredArmRequested && deps.isIdle()) rearmWhenPossible(deps, state);
+		return;
+	}
+	if (deps.isIdle() && (deferredArmRequested || state.activityGeneration === target.activityGeneration)) {
+		rearmWhenPossible(deps, state);
+	} else {
+		publishSettledWarmStatus(deps, state);
+	}
+}
+
+/**
+ * Creates a cache warmer for captured Anthropic provider requests.
+ * @param deps - {WarmerDeps} The timer, request, state, and UI dependencies.
+ * @returns {Warmer} A cache warmer controller.
+ */
 export function createWarmer(deps: WarmerDeps): Warmer {
 	const state: WarmerState = {
 		lastPayload: undefined,
@@ -123,88 +284,41 @@ export function createWarmer(deps: WarmerDeps): Warmer {
 		inFlight: false,
 		disposed: false,
 		warmCount: 0,
+		lastWarmStatus: "",
+		activeRequest: undefined,
+		targetVersion: 0,
+		activityGeneration: 0,
+		armRequested: false,
 	};
 
-	function cancel(): void {
-		if (state.timerHandle === undefined) return;
-		deps.clearTimer(state.timerHandle);
-		state.timerHandle = undefined;
-	}
-
-	function capture(payload: unknown, model: AnyModel | undefined): void {
-		state.lastPayload = payload;
-		state.lastModel = model;
-	}
-
-	function updateModel(model: AnyModel | undefined): void {
-		state.lastModel = model;
-	}
-
-	function currentWarmTarget(): WarmTarget | undefined {
-		if (state.disposed || state.inFlight) return undefined;
-		if (!deps.isIdle()) return undefined;
-		if (state.lastPayload === undefined) return undefined;
-		if (!isAnthropicModel(state.lastModel)) return undefined;
-		if (isDisabled(deps.env)) return undefined;
-		return { model: state.lastModel, payload: state.lastPayload };
-	}
-
-	async function sendWarmRequest(model: AnyModel, payload: unknown): Promise<void> {
-		const auth = await deps.resolveAuth(model);
-		if (!auth.ok) {
-			deps.notify(`warm request skipped: ${auth.error}`, "warning");
-			return;
-		}
-		const timeout = withTimeoutSignal(deps, WARM_REQUEST_TIMEOUT_MS);
-		try {
-			await deps.fetchImpl(anthropicEndpoint(model), {
-				method: "POST",
-				headers: buildWarmHeaders(auth),
-				body: JSON.stringify(buildWarmBody(payload)),
-				signal: timeout.signal,
-			});
-			state.warmCount += 1;
-			deps.notify(`warmed (count ${state.warmCount})`, "info");
-		} finally {
-			timeout.dispose();
-		}
-	}
-
-	async function fireNow(): Promise<void> {
-		const target = currentWarmTarget();
-		if (!target) return;
-		state.inFlight = true;
-		try {
-			await sendWarmRequest(target.model, target.payload);
-		} catch (error) {
-			deps.notify(`warm request failed: ${String(error)}`, "warning");
-		} finally {
-			state.inFlight = false;
-		}
-		if (!state.disposed && deps.isIdle()) arm();
-	}
-
-	function arm(): void {
-		if (state.disposed) return;
-		cancel();
-		state.timerHandle = deps.setTimer(() => {
-			state.timerHandle = undefined;
-			void fireNow();
-		}, resolveIntervalMs(deps.env));
-	}
-
-	function dispose(): void {
-		state.disposed = true;
-		cancel();
-	}
-
 	return {
-		capture,
-		updateModel,
-		arm,
-		cancel,
-		dispose,
-		fireNow,
+		capture: (payload, model) => {
+			if (state.inFlight) clearWarmStatus(deps, state);
+			state.lastPayload = payload;
+			state.lastModel = model;
+			state.targetVersion += 1;
+		},
+		updateModel: (_model) => {
+			if (state.disposed) return;
+			state.lastPayload = undefined;
+			state.lastModel = undefined;
+			state.targetVersion += 1;
+			state.armRequested = false;
+			cancelTimer(deps, state);
+			clearWarmStatus(deps, state);
+		},
+		arm: () => armWarm(deps, state),
+		cancel: () => cancelWarm(deps, state),
+		dispose: () => {
+			state.disposed = true;
+			state.targetVersion += 1;
+			state.armRequested = false;
+			cancelTimer(deps, state);
+			clearWarmStatus(deps, state);
+			state.activeRequest?.abort();
+			state.activeRequest = undefined;
+		},
+		fireNow: () => fireWarmRequest(deps, state),
 		get warmCount() {
 			return state.warmCount;
 		},
@@ -229,6 +343,10 @@ function createRealDeps(getCtx: () => ExtensionContext | undefined): WarmerDeps 
 		notify: (message, level) => {
 			const ctx = getCtx();
 			if (ctx?.hasUI) ctx.ui.notify(`pi-cache-warmer: ${message}`, level);
+		},
+		setStatus: (message) => {
+			const ctx = getCtx();
+			if (ctx?.hasUI) ctx.ui.setStatus("pi-cache-warmer", message);
 		},
 		env: process.env,
 	};
